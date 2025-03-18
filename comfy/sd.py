@@ -1,4 +1,5 @@
 from __future__ import annotations
+import json
 import torch
 from enum import Enum
 import logging
@@ -134,8 +135,8 @@ class CLIP:
     def clip_layer(self, layer_idx):
         self.layer_idx = layer_idx
 
-    def tokenize(self, text, return_word_ids=False):
-        return self.tokenizer.tokenize_with_weights(text, return_word_ids)
+    def tokenize(self, text, return_word_ids=False, **kwargs):
+        return self.tokenizer.tokenize_with_weights(text, return_word_ids, **kwargs)
 
     def add_hooks_to_dict(self, pooled_dict: dict[str]):
         if self.apply_hooks_to_conds:
@@ -249,7 +250,7 @@ class CLIP:
         return self.patcher.get_key_patches()
 
 class VAE:
-    def __init__(self, sd=None, device=None, config=None, dtype=None):
+    def __init__(self, sd=None, device=None, config=None, dtype=None, metadata=None):
         if 'decoder.up_blocks.0.resnets.0.norm1.weight' in sd.keys(): #diffusers format
             sd = diffusers_convert.convert_vae_state_dict(sd)
 
@@ -357,7 +358,12 @@ class VAE:
                     version = 0
                 elif tensor_conv1.shape[0] == 1024:
                     version = 1
-                self.first_stage_model = comfy.ldm.lightricks.vae.causal_video_autoencoder.VideoVAE(version=version)
+                    if "encoder.down_blocks.1.conv.conv.bias" in sd:
+                        version = 2
+                vae_config = None
+                if metadata is not None and "config" in metadata:
+                    vae_config = json.loads(metadata["config"]).get("vae", None)
+                self.first_stage_model = comfy.ldm.lightricks.vae.causal_video_autoencoder.VideoVAE(version=version, config=vae_config)
                 self.latent_channels = 128
                 self.latent_dim = 3
                 self.memory_used_decode = lambda shape, dtype: (900 * shape[2] * shape[3] * shape[4] * (8 * 8 * 8)) * model_management.dtype_size(dtype)
@@ -434,6 +440,10 @@ class VAE:
         self.patcher = comfy.model_patcher.ModelPatcher(self.first_stage_model, load_device=self.device, offload_device=offload_device)
         logging.info("VAE load device: {}, offload device: {}, dtype: {}".format(self.device, offload_device, self.vae_dtype))
 
+    def throw_exception_if_invalid(self):
+        if self.first_stage_model is None:
+            raise RuntimeError("ERROR: VAE is invalid: None\n\nIf the VAE is from a checkpoint loader node your checkpoint does not contain a valid VAE.")
+
     def vae_encode_crop_pixels(self, pixels):
         downscale_ratio = self.spacial_compression_encode()
 
@@ -489,6 +499,7 @@ class VAE:
         return comfy.utils.tiled_scale_multidim(samples, encode_fn, tile=(tile_t, tile_x, tile_y), overlap=overlap, upscale_amount=self.downscale_ratio, out_channels=self.latent_channels, downscale=True, index_formulas=self.downscale_index_formula, output_device=self.output_device)
 
     def decode(self, samples_in):
+        self.throw_exception_if_invalid()
         pixel_samples = None
         try:
             memory_used = self.memory_used_decode(samples_in.shape, self.vae_dtype)
@@ -519,6 +530,7 @@ class VAE:
         return pixel_samples
 
     def decode_tiled(self, samples, tile_x=None, tile_y=None, overlap=None, tile_t=None, overlap_t=None):
+        self.throw_exception_if_invalid()
         memory_used = self.memory_used_decode(samples.shape, self.vae_dtype) #TODO: calculate mem required for tile
         model_management.load_models_gpu([self.patcher], memory_required=memory_used)
         dims = samples.ndim - 2
@@ -547,6 +559,7 @@ class VAE:
         return output.movedim(1, -1)
 
     def encode(self, pixel_samples):
+        self.throw_exception_if_invalid()
         pixel_samples = self.vae_encode_crop_pixels(pixel_samples)
         pixel_samples = pixel_samples.movedim(-1, 1)
         if self.latent_dim == 3 and pixel_samples.ndim < 5:
@@ -579,6 +592,7 @@ class VAE:
         return samples
 
     def encode_tiled(self, pixel_samples, tile_x=None, tile_y=None, overlap=None, tile_t=None, overlap_t=None):
+        self.throw_exception_if_invalid()
         pixel_samples = self.vae_encode_crop_pixels(pixel_samples)
         dims = self.latent_dim
         pixel_samples = pixel_samples.movedim(-1, 1)
@@ -873,13 +887,13 @@ def load_checkpoint(config_path=None, ckpt_path=None, output_vae=True, output_cl
     return (model, clip, vae)
 
 def load_checkpoint_guess_config(ckpt_path, output_vae=True, output_clip=True, output_clipvision=False, embedding_directory=None, output_model=True, model_options={}, te_model_options={}):
-    sd = comfy.utils.load_torch_file(ckpt_path)
-    out = load_state_dict_guess_config(sd, output_vae, output_clip, output_clipvision, embedding_directory, output_model, model_options, te_model_options=te_model_options)
+    sd, metadata = comfy.utils.load_torch_file(ckpt_path, return_metadata=True)
+    out = load_state_dict_guess_config(sd, output_vae, output_clip, output_clipvision, embedding_directory, output_model, model_options, te_model_options=te_model_options, metadata=metadata)
     if out is None:
         raise RuntimeError("ERROR: Could not detect model type of: {}".format(ckpt_path))
     return out
 
-def load_state_dict_guess_config(sd, output_vae=True, output_clip=True, output_clipvision=False, embedding_directory=None, output_model=True, model_options={}, te_model_options={}):
+def load_state_dict_guess_config(sd, output_vae=True, output_clip=True, output_clipvision=False, embedding_directory=None, output_model=True, model_options={}, te_model_options={}, metadata=None):
     clip = None
     clipvision = None
     vae = None
@@ -891,9 +905,14 @@ def load_state_dict_guess_config(sd, output_vae=True, output_clip=True, output_c
     weight_dtype = comfy.utils.weight_dtype(sd, diffusion_model_prefix)
     load_device = model_management.get_torch_device()
 
-    model_config = model_detection.model_config_from_unet(sd, diffusion_model_prefix)
+    model_config = model_detection.model_config_from_unet(sd, diffusion_model_prefix, metadata=metadata)
     if model_config is None:
-        return None
+        logging.warning("Warning, This is not a checkpoint file, trying to load it as a diffusion model only.")
+        diffusion_model = load_diffusion_model_state_dict(sd, model_options={})
+        if diffusion_model is None:
+            return None
+        return (diffusion_model, None, VAE(sd={}), None)  # The VAE object is there to throw an exception if it's actually used'
+
 
     unet_weight_dtype = list(model_config.supported_inference_dtypes)
     if model_config.scaled_fp8 is not None:
@@ -920,7 +939,7 @@ def load_state_dict_guess_config(sd, output_vae=True, output_clip=True, output_c
     if output_vae:
         vae_sd = comfy.utils.state_dict_prefix_replace(sd, {k: "" for k in model_config.vae_key_prefix}, filter_keys=True)
         vae_sd = model_config.process_vae_state_dict(vae_sd)
-        vae = VAE(sd=vae_sd)
+        vae = VAE(sd=vae_sd, metadata=metadata)
 
     if output_clip:
         clip_target = model_config.clip_target(state_dict=sd)
