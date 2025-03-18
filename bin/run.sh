@@ -33,7 +33,7 @@ start)
   python main.py --port 6006 --listen 0.0.0.0
  ;;
 restart)
-  kill -9 $(lsof -t -i:6006)
+  kill -9 $(lsof -t -i:6006) || true
   python main.py --port 6006 --listen 0.0.0.0
  ;;
 *)

@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 set -xe
 
-# 脚本路径
 sc_dir="$(
   cd "$(dirname "$0")" >/dev/null 2>&1 || exit
   pwd -P
@@ -21,7 +20,7 @@ help)
   ebc_debug "示例: model.sh install"
   ;;
 install)
-  modelscope download --model Comfy-Org/stable-diffusion-v1-5-archive
+  #modelscope download --model Comfy-Org/stable-diffusion-v1-5-archive
   modelscope download --model Comfy-Org/stable-diffusion-v1-5-archive v1-5-pruned-emaonly-fp16.safetensors
 ;;
 *)
